@@ -8,6 +8,8 @@ import logging
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
+import numpy as np
+
 import etils.epath as epath
 import flax.nnx as nnx
 from typing_extensions import override
@@ -261,6 +263,131 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
         )
         if self.use_delta_joint_actions:
             delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class _SingleArmAlohaInputs(_transforms.DataTransformFn):
+    """Inputs for single-arm Aloha-style datasets with three camera views."""
+
+    adapt_to_pi: bool = False
+    EXPECTED_CAMERAS: tuple[str, ...] = ("cam_high", "cam_left_wrist", "cam_right_wrist")
+
+    def __call__(self, data: dict) -> dict:
+        images = data["images"]
+        if set(images) - set(self.EXPECTED_CAMERAS):
+            raise ValueError(f"Expected images to be subset of {self.EXPECTED_CAMERAS}, got {tuple(images)}")
+
+        if self.adapt_to_pi:
+            raise NotImplementedError("adapt_to_pi conversion is not implemented for single-arm datasets")
+
+        raw_base_image = np.asarray(images["cam_high"])
+        if raw_base_image.ndim != 3:
+            raise ValueError("Expected cam_high images to have shape [channel, height, width]")
+
+        def convert_image(arr: Any) -> np.ndarray:
+            arr = np.asarray(arr)
+            if np.issubdtype(arr.dtype, np.floating):
+                arr = (255 * arr).astype(np.uint8)
+            return np.moveaxis(arr, 0, -1)
+
+        left_wrist_image = images.get("cam_left_wrist")
+        right_wrist_image = images.get("cam_right_wrist")
+        base_image = convert_image(raw_base_image)
+        inputs = {
+            "image": {
+                "base_0_rgb": base_image,
+                "left_wrist_0_rgb": convert_image(left_wrist_image)
+                if left_wrist_image is not None
+                else np.zeros_like(base_image),
+                "right_wrist_0_rgb": convert_image(right_wrist_image)
+                if right_wrist_image is not None
+                else np.zeros_like(base_image),
+            },
+            "image_mask": {
+                "base_0_rgb": np.True_,
+                "left_wrist_0_rgb": np.True_ if left_wrist_image is not None else np.False_,
+                "right_wrist_0_rgb": np.True_ if right_wrist_image is not None else np.False_,
+            },
+            "state": np.asarray(data["state"], dtype=np.float32),
+        }
+
+        if inputs["state"].shape[-1] != 8:
+            raise ValueError(f"Expected state to have last dimension 8, got {inputs['state'].shape}")
+
+        if "actions" in data:
+            actions = np.asarray(data["actions"], dtype=np.float32)
+            if actions.shape[-1] < 8:
+                raise ValueError(f"Expected actions to have at least 8 dims, got {actions.shape}")
+            inputs["actions"] = actions[..., :8]
+
+        if "prompt" in data:
+            inputs["prompt"] = data["prompt"]
+
+        return inputs
+
+
+@dataclasses.dataclass(frozen=True)
+class _SingleArmAlohaOutputs(_transforms.DataTransformFn):
+    """Outputs for single-arm Aloha-style datasets."""
+
+    action_dim: int
+
+    def __call__(self, data: dict) -> dict:
+        actions = np.asarray(data["actions"], dtype=np.float32)
+        if actions.shape[-1] < self.action_dim:
+            raise ValueError(f"Expected model actions to have at least {self.action_dim} dims, got {actions.shape}")
+        return {"actions": actions[..., : self.action_dim]}
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotSingleArmAlohaDataConfig(DataConfigFactory):
+    """Data config for single-arm Aloha-style datasets with 8-D actions."""
+
+    use_delta_joint_actions: bool = True
+    default_prompt: str | None = None
+    adapt_to_pi: bool = False
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "cam_high": "observation.images.cam_high",
+                            "cam_left_wrist": "observation.images.cam_left_wrist",
+                            "cam_right_wrist": "observation.images.cam_right_wrist",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                    }
+                )
+            ]
+        )
+    )
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[_SingleArmAlohaInputs(adapt_to_pi=self.adapt_to_pi)],
+            outputs=[_SingleArmAlohaOutputs(action_dim=model_config.action_dim)],
+        )
+
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(7, -1)
             data_transforms = data_transforms.push(
                 inputs=[_transforms.DeltaActions(delta_action_mask)],
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
@@ -960,6 +1087,40 @@ _CONFIGS = [
     # RoboArena configs.
     #
     *roboarena_config.get_roboarena_configs(),
+    #
+    # Yushun's configs
+    #
+    TrainConfig(
+        name="pi05_pour_water",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotSingleArmAlohaDataConfig(
+            repo_id="/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/yushun/openpi/datasets/OCL4Rob-merge/pour-orange-all",  # your datasets repo_id
+            adapt_to_pi=False,
+            repack_transforms=_transforms.Group(inputs=[
+                _transforms.RepackTransform({
+                    "images": {
+                        "cam_high": "observation.images.head",
+                        "cam_left_wrist": "observation.images.side",
+                        "cam_right_wrist": "observation.images.wrist",
+                    },
+                    "state": "observation.state",
+                    "actions": "action",
+                    "prompt": "prompt",
+                })
+            ]),
+            base_config=DataConfig(
+                prompt_from_task=True,  # Set to True for prompt by task_name
+            ),
+        ),
+        # freeze_filter=pi0_config.Pi0Config(pi05=True).get_freeze_filter(),
+        batch_size=32,  # the total batch_size not pre_gpu batch_size
+        weight_loader=weight_loaders.CheckpointWeightLoader("/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/yushun/openpi/models/pi05_base/params"),
+        num_train_steps=200000,
+        # freeze_filter=pi0_config.Pi0Config().get_freeze_filter(),
+        save_interval=20000,
+        fsdp_devices=1,  # refer line 359
+        num_workers=12,
+    ),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
